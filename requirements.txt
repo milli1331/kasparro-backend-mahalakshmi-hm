@@ -1,10 +1,15 @@
-fastapi==0.109.0
-uvicorn==0.27.0
-sqlalchemy==2.0.25
-psycopg2-binary==2.9.9
-pydantic==2.6.0
-pydantic-settings==2.1.0
-requests==2.31.0
-python-dotenv==1.0.1
-pytest==8.0.0
-httpx==0.26.0
+git add .
+git commit -m "Final submission code"
+git branch -M main
+git remote add origin https://github.com/milli1331/kasparro-backend-mahalakshmi-hm.git
+git push -u origin main
+
+git config --global user.email "mahalakshmihm.2424@gmail.com"
+git config --global user.name "Mahalakshmi HM"
+
+postgresql://kasparro_db_0w8i_user:G0gbdhBgupCtqJM7kbdReM2KCu6wprs2@dpg-d57009shg0os73av3ca0-a/kasparro_db_0w8i
+
+ URL https://kasparro-backend-o32j.onrender.com
+https://kasparro-backend-o32j.onrender.com/docs
+
+postgresql://kasparro_db_0w8i_user:G0gbdhBgupCtqJM7kbdReM2KCu6wprs2@dpg-d57009shg0os73av3ca0-a.singapore-postgres.render.com/kasparro_db_0w8i

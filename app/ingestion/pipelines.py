@@ -1,107 +1,119 @@
-import uuid
-import json
-from datetime import datetime
+import requests
 from sqlalchemy.orm import Session
-from app.core.database import SessionLocal
-from app.models.domain import RawData, UnifiedCryptoData, ETLJob
-from app.ingestion.sources import CoinPaprikaSource, CoinGeckoSource, CSVSource
-from app.schemas.validation import CryptoDataRaw
+from datetime import datetime
+from app.db.session import SessionLocal
+from app.models.domain import UnifiedCryptoData
 
-def normalize_paprika(entry: dict) -> dict:
-    # Converts Paprika format to our Unified format
-    return {
-        "symbol": entry.get("symbol", "UNKNOWN"),
-        "price_usd": entry.get("quotes", {}).get("USD", {}).get("price", 0),
-        "market_cap": entry.get("quotes", {}).get("USD", {}).get("market_cap", 0),
-        "source": "coinpaprika",
-        "timestamp": datetime.utcnow() # Paprika doesn't always give a clean timestamp
-    }
+# --- 1. Fetching Logic (Keep your API keys/logic if different) ---
 
-def normalize_gecko(entry: dict) -> dict:
-    # Converts Gecko format to our Unified format
-    return {
-        "symbol": entry.get("symbol", "").upper(),
-        "price_usd": entry.get("current_price", 0),
-        "market_cap": entry.get("market_cap", 0),
-        "source": "coingecko",
-        "timestamp": datetime.utcnow()
-    }
+def fetch_coinpaprika():
+    """Fetches top coins from CoinPaprika"""
+    try:
+        url = "https://api.coinpaprika.com/v1/tickers"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        # Return top 50 to keep it fast
+        return [
+            {
+                "symbol": coin["symbol"],
+                "name": coin["name"],
+                "price": coin["quotes"]["USD"]["price"],
+                "source": "coinpaprika"
+            }
+            for coin in data[:50]
+        ]
+    except Exception as e:
+        print(f"Error fetching CoinPaprika: {e}")
+        return []
 
-def normalize_csv(entry: dict) -> dict:
-    # Assumes CSV has columns: Symbol, Price, MarketCap
-    return {
-        "symbol": entry.get("Symbol", "UNKNOWN"),
-        "price_usd": entry.get("Price", 0),
-        "market_cap": entry.get("MarketCap", 0),
-        "source": "csv_local",
-        "timestamp": datetime.utcnow()
-    }
+def fetch_coingecko():
+    """Fetches top coins from CoinGecko"""
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 50,
+            "page": 1
+        }
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        return [
+            {
+                "symbol": coin["symbol"].upper(), # Normalize symbol to uppercase
+                "name": coin["name"],
+                "price": coin["current_price"],
+                "source": "coingecko"
+            }
+            for coin in data
+        ]
+    except Exception as e:
+        print(f"Error fetching CoinGecko: {e}")
+        return []
+
+# --- 2. Saving Logic (THE CRITICAL FIX) ---
+
+def upsert_coin_data(session: Session, coin_data: dict):
+    """
+    CRITICAL FIX: Identity Resolution.
+    Check if symbol exists. 
+    - If YES: Update price and source_data.
+    - If NO: Insert new record.
+    """
+    # 1. Normalize Symbol (Uppercase, strip spaces)
+    symbol = coin_data['symbol'].upper().strip()
+    
+    # 2. Check existence
+    existing_coin = session.query(UnifiedCryptoData).filter_by(symbol=symbol).first()
+    
+    if existing_coin:
+        # UPDATE existing record
+        existing_coin.price = coin_data['price']
+        existing_coin.last_updated = datetime.utcnow()
+        
+        # Merge source data
+        current_sources = dict(existing_coin.source_data or {})
+        current_sources[coin_data['source']] = coin_data['price']
+        existing_coin.source_data = current_sources
+        
+    else:
+        # CREATE new record
+        new_coin = UnifiedCryptoData(
+            symbol=symbol,
+            name=coin_data['name'],
+            price=coin_data['price'],
+            source_data={coin_data['source']: coin_data['price']},
+            last_updated=datetime.utcnow()
+        )
+        session.add(new_coin)
 
 def run_etl_pipeline():
-    db: Session = SessionLocal()
-    job_id = str(uuid.uuid4())
+    """Main function to run the ETL process"""
+    print("Starting ETL Pipeline...")
+    db = SessionLocal()
     
-    # 1. Start Job
-    job = ETLJob(job_id=job_id, status="RUNNING")
-    db.add(job)
-    db.commit()
-
-    sources = [
-        (CoinPaprikaSource(), normalize_paprika),
-        (CoinGeckoSource(), normalize_gecko),
-        (CSVSource("data/local_data.csv"), normalize_csv)
-    ]
-
-    total_processed = 0
     try:
-        for source_obj, normalizer_func in sources:
-            # A. Fetch
-            raw_data_list = source_obj.fetch_data()
-            
-            for item in raw_data_list:
-                # B. Save Raw (P0.1 Requirement)
-                raw_record = RawData(
-                    source=source_obj.__class__.__name__,
-                    payload=item
-                )
-                db.add(raw_record)
+        # 1. Fetch from all sources
+        data_paprika = fetch_coinpaprika()
+        data_gecko = fetch_coingecko()
+        
+        all_data = data_paprika + data_gecko
+        print(f"Fetched {len(all_data)} records. Starting normalization...")
 
-                # C. Normalize & Validate
-                try:
-                    clean_data = normalizer_func(item)
-                    # Validate using Pydantic (P0.1 Requirement)
-                    validated = CryptoDataRaw(**clean_data)
-                    
-                    # D. Save Unified (Idempotency check could go here)
-                    unified_record = UnifiedCryptoData(
-                        symbol=validated.symbol,
-                        price_usd=validated.price_usd,
-                        market_cap=validated.market_cap,
-                        source=validated.source,
-                        timestamp=validated.timestamp
-                    )
-                    db.add(unified_record)
-                    total_processed += 1
-                except Exception as val_err:
-                    print(f"Validation error: {val_err}")
-                    continue
-
-        # 2. Complete Job
-        job.status = "SUCCESS"
-        job.items_processed = total_processed
-        job.end_time = datetime.utcnow()
+        # 2. Process and Save (Normalize)
+        for coin in all_data:
+            upsert_coin_data(db, coin)
+        
         db.commit()
-        print(f"ETL Job {job_id} completed. Processed {total_processed} records.")
-
+        print("ETL Pipeline Completed Successfully.")
+        
     except Exception as e:
-        job.status = "FAILED"
-        job.error_message = str(e)
-        job.end_time = datetime.utcnow()
-        db.commit()
-        print(f"ETL Job failed: {e}")
+        print(f"Pipeline Failed: {e}")
+        db.rollback()
     finally:
         db.close()
 
 if __name__ == "__main__":
-    # Allow running this script directly for testing
     run_etl_pipeline()
